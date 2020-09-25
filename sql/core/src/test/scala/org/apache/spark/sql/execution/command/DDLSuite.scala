@@ -28,8 +28,8 @@ import org.apache.spark.{SparkException, SparkFiles}
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.RDD_PARALLEL_LISTING_THRESHOLD
 import org.apache.spark.sql.{AnalysisException, QueryTest, Row, SaveMode}
-import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, NoSuchDatabaseException, NoSuchPartitionException, NoSuchTableException, TempTableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, QualifiedTableName, TableIdentifier}
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, NoSuchDatabaseException, NoSuchFunctionException, NoSuchPartitionException, NoSuchTableException, TempTableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
@@ -1033,7 +1033,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     df.write.insertInto("students")
     spark.catalog.cacheTable("students")
     checkAnswer(spark.table("students"), df)
-    assume(spark.catalog.isCached("students"), "bad test: table was not cached in the first place")
+    assert(spark.catalog.isCached("students"), "bad test: table was not cached in the first place")
     sql("ALTER TABLE students RENAME TO teachers")
     sql("CREATE TABLE students (age INT, name STRING) USING parquet")
     // Now we have both students and teachers.
@@ -1203,14 +1203,24 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
   }
 
   test("alter table: recover partitions (sequential)") {
-    withSQLConf(RDD_PARALLEL_LISTING_THRESHOLD.key -> "10") {
+    val oldRddParallelListingThreshold = spark.sparkContext.conf.get(
+      RDD_PARALLEL_LISTING_THRESHOLD)
+    try {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD.key, "10")
       testRecoverPartitions()
+    } finally {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD, oldRddParallelListingThreshold)
     }
   }
 
   test("alter table: recover partition (parallel)") {
-    withSQLConf(RDD_PARALLEL_LISTING_THRESHOLD.key -> "0") {
+    val oldRddParallelListingThreshold = spark.sparkContext.conf.get(
+      RDD_PARALLEL_LISTING_THRESHOLD)
+    try {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD.key, "0")
       testRecoverPartitions()
+    } finally {
+      spark.sparkContext.conf.set(RDD_PARALLEL_LISTING_THRESHOLD, oldRddParallelListingThreshold)
     }
   }
 
@@ -1853,6 +1863,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             "Returns the concatenation of col1, col2, ..., colN.") :: Nil
     )
     // extended mode
+    // scalastyle:off whitespace.end.of.line
     checkAnswer(
       sql("DESCRIBE FUNCTION EXTENDED ^"),
       Row("Class: org.apache.spark.sql.catalyst.expressions.BitwiseXor") ::
@@ -1861,11 +1872,14 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             |    Examples:
             |      > SELECT 3 ^ 5;
             |       6
-            |  """.stripMargin) ::
+            |  
+            |    Since: 1.4.0
+            |""".stripMargin) ::
         Row("Function: ^") ::
         Row("Usage: expr1 ^ expr2 - Returns the result of " +
           "bitwise exclusive OR of `expr1` and `expr2`.") :: Nil
     )
+    // scalastyle:on whitespace.end.of.line
   }
 
   test("create a data source table without schema") {
@@ -1959,7 +1973,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     Seq("json", "parquet").foreach { format =>
       withTable("rectangles") {
         data.write.format(format).saveAsTable("rectangles")
-        assume(spark.table("rectangles").collect().nonEmpty,
+        assert(spark.table("rectangles").collect().nonEmpty,
           "bad test; table was empty to begin with")
 
         sql("TRUNCATE TABLE rectangles")
@@ -2080,6 +2094,27 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             assert(aclEntries.get(3) == other)
           }
         }
+      }
+    }
+  }
+
+  test("SPARK-31163: acl/permission should handle non-existed path when truncating table") {
+    withSQLConf(SQLConf.TRUNCATE_TABLE_IGNORE_PERMISSION_ACL.key -> "false") {
+      withTable("tab1") {
+        sql("CREATE TABLE tab1 (col1 STRING, col2 INT) USING parquet PARTITIONED BY (col2)")
+        sql("INSERT INTO tab1 SELECT 'one', 1")
+        checkAnswer(spark.table("tab1"), Row("one", 1))
+        val part = spark.sessionState.catalog.listPartitions(TableIdentifier("tab1")).head
+        val path = new File(part.location.getPath)
+        sql("TRUNCATE TABLE tab1")
+        // simulate incomplete/unsuccessful truncate
+        assert(path.exists())
+        path.delete()
+        assert(!path.exists())
+        // execute without java.io.FileNotFoundException
+        sql("TRUNCATE TABLE tab1")
+        // partition path should be re-created
+        assert(path.exists())
       }
     }
   }
@@ -2982,20 +3017,169 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     }
   }
 
-  test("Add a directory when spark.sql.legacy.addDirectory.recursive.enabled set to true") {
+  test(s"Add a directory when ${SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key} set to false") {
     val directoryToAdd = Utils.createTempDir("/tmp/spark/addDirectory/")
     val testFile = File.createTempFile("testFile", "1", directoryToAdd)
     spark.sql(s"ADD FILE $directoryToAdd")
     assert(new File(SparkFiles.get(s"${directoryToAdd.getName}/${testFile.getName}")).exists())
   }
 
-  test("Add a directory when spark.sql.legacy.addDirectory.recursive.enabled not set to true") {
+  test(s"Add a directory when ${SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key} set to true") {
     withTempDir { testDir =>
-      withSQLConf(SQLConf.LEGACY_ADD_DIRECTORY_USING_RECURSIVE.key -> "false") {
+      withSQLConf(SQLConf.LEGACY_ADD_SINGLE_FILE_IN_ADD_FILE.key -> "true") {
         val msg = intercept[SparkException] {
           spark.sql(s"ADD FILE $testDir")
         }.getMessage
         assert(msg.contains("is a directory and recursive is not turned on"))
+      }
+    }
+  }
+
+  test("REFRESH FUNCTION") {
+    val msg = intercept[AnalysisException] {
+      sql("REFRESH FUNCTION md5")
+    }.getMessage
+    assert(msg.contains("Cannot refresh built-in function"))
+    val msg2 = intercept[NoSuchFunctionException] {
+      sql("REFRESH FUNCTION default.md5")
+    }.getMessage
+    assert(msg2.contains(s"Undefined function: 'md5'. This function is neither a registered " +
+      s"temporary function nor a permanent function registered in the database 'default'."))
+
+    withUserDefinedFunction("func1" -> true) {
+      sql("CREATE TEMPORARY FUNCTION func1 AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      val msg = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION func1")
+      }.getMessage
+      assert(msg.contains("Cannot refresh temporary function"))
+    }
+
+    withUserDefinedFunction("func1" -> false) {
+      val func = FunctionIdentifier("func1", Some("default"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func1")
+      }
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+
+      sql("CREATE FUNCTION func1 AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      sql("REFRESH FUNCTION func1")
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+      val msg = intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func2")
+      }.getMessage
+      assert(msg.contains(s"Undefined function: 'func2'. This function is neither a registered " +
+        s"temporary function nor a permanent function registered in the database 'default'."))
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+
+      spark.sessionState.catalog.externalCatalog.dropFunction("default", "func1")
+      assert(spark.sessionState.catalog.isRegisteredFunction(func))
+      intercept[NoSuchFunctionException] {
+        sql("REFRESH FUNCTION func1")
+      }
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+
+      val function = CatalogFunction(func, "test.non.exists.udf", Seq.empty)
+      spark.sessionState.catalog.createFunction(function, false)
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+      val err = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION func1")
+      }.getMessage
+      assert(err.contains("Can not load class"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(func))
+    }
+  }
+
+  test("REFRESH FUNCTION persistent function with the same name as the built-in function") {
+    withUserDefinedFunction("default.rand" -> false) {
+      val rand = FunctionIdentifier("rand", Some("default"))
+      sql("CREATE FUNCTION rand AS 'test.org.apache.spark.sql.MyDoubleAvg'")
+      assert(!spark.sessionState.catalog.isRegisteredFunction(rand))
+      val msg = intercept[AnalysisException] {
+        sql("REFRESH FUNCTION rand")
+      }.getMessage
+      assert(msg.contains("Cannot refresh built-in function"))
+      assert(!spark.sessionState.catalog.isRegisteredFunction(rand))
+      sql("REFRESH FUNCTION default.rand")
+      assert(spark.sessionState.catalog.isRegisteredFunction(rand))
+    }
+  }
+
+  test("SPARK-32481 Move data to trash on truncate table if enabled") {
+    val trashIntervalKey = "fs.trash.interval"
+    withTable("tab1") {
+      withSQLConf(SQLConf.TRUNCATE_TRASH_ENABLED.key -> "true") {
+        sql("CREATE TABLE tab1 (col INT) USING parquet")
+        sql("INSERT INTO tab1 SELECT 1")
+        // scalastyle:off hadoopconfiguration
+        val hadoopConf = spark.sparkContext.hadoopConfiguration
+        // scalastyle:on hadoopconfiguration
+        val originalValue = hadoopConf.get(trashIntervalKey, "0")
+        val tablePath = new Path(spark.sessionState.catalog
+          .getTableMetadata(TableIdentifier("tab1")).storage.locationUri.get)
+
+        val fs = tablePath.getFileSystem(hadoopConf)
+        val trashCurrent = new Path(fs.getHomeDirectory, ".Trash/Current")
+        val trashPath = Path.mergePaths(trashCurrent, tablePath)
+        assume(
+          fs.mkdirs(trashPath) && fs.delete(trashPath, false),
+          "Trash directory could not be created, skipping.")
+        assert(!fs.exists(trashPath))
+        try {
+          hadoopConf.set(trashIntervalKey, "5")
+          sql("TRUNCATE TABLE tab1")
+        } finally {
+          hadoopConf.set(trashIntervalKey, originalValue)
+        }
+        assert(fs.exists(trashPath))
+        fs.delete(trashPath, true)
+      }
+    }
+  }
+
+  test("SPARK-32481 delete data permanently on truncate table if trash interval is non-positive") {
+    val trashIntervalKey = "fs.trash.interval"
+    withTable("tab1") {
+      withSQLConf(SQLConf.TRUNCATE_TRASH_ENABLED.key -> "true") {
+        sql("CREATE TABLE tab1 (col INT) USING parquet")
+        sql("INSERT INTO tab1 SELECT 1")
+        // scalastyle:off hadoopconfiguration
+        val hadoopConf = spark.sparkContext.hadoopConfiguration
+        // scalastyle:on hadoopconfiguration
+        val originalValue = hadoopConf.get(trashIntervalKey, "0")
+        val tablePath = new Path(spark.sessionState.catalog
+          .getTableMetadata(TableIdentifier("tab1")).storage.locationUri.get)
+
+        val fs = tablePath.getFileSystem(hadoopConf)
+        val trashCurrent = new Path(fs.getHomeDirectory, ".Trash/Current")
+        val trashPath = Path.mergePaths(trashCurrent, tablePath)
+        assert(!fs.exists(trashPath))
+        try {
+          hadoopConf.set(trashIntervalKey, "0")
+          sql("TRUNCATE TABLE tab1")
+        } finally {
+          hadoopConf.set(trashIntervalKey, originalValue)
+        }
+        assert(!fs.exists(trashPath))
+      }
+    }
+  }
+
+  test("SPARK-32481 Do not move data to trash on truncate table if disabled") {
+    withTable("tab1") {
+      withSQLConf(SQLConf.TRUNCATE_TRASH_ENABLED.key -> "false") {
+        sql("CREATE TABLE tab1 (col INT) USING parquet")
+        sql("INSERT INTO tab1 SELECT 1")
+        val hadoopConf = spark.sessionState.newHadoopConf()
+        val tablePath = new Path(spark.sessionState.catalog
+          .getTableMetadata(TableIdentifier("tab1")).storage.locationUri.get)
+
+        val fs = tablePath.getFileSystem(hadoopConf)
+        val trashCurrent = new Path(fs.getHomeDirectory, ".Trash/Current")
+        val trashPath = Path.mergePaths(trashCurrent, tablePath)
+        sql("TRUNCATE TABLE tab1")
+        assert(!fs.exists(trashPath))
       }
     }
   }

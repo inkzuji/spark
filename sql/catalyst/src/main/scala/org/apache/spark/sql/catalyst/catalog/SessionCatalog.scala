@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.catalog
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.Callable
+import java.util.concurrent.TimeUnit
 import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable
@@ -38,9 +39,11 @@ import org.apache.spark.sql.catalyst.expressions.{Expression, ExpressionInfo, Im
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias, View}
 import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.GLOBAL_TEMP_DATABASE
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.Utils
 
 object SessionCatalog {
@@ -134,7 +137,16 @@ class SessionCatalog(
 
   private val tableRelationCache: Cache[QualifiedTableName, LogicalPlan] = {
     val cacheSize = conf.tableRelationCacheSize
-    CacheBuilder.newBuilder().maximumSize(cacheSize).build[QualifiedTableName, LogicalPlan]()
+    val cacheTTL = conf.metadataCacheTTL
+
+    var builder = CacheBuilder.newBuilder()
+      .maximumSize(cacheSize)
+
+    if (cacheTTL > 0) {
+      builder = builder.expireAfterWrite(cacheTTL, TimeUnit.SECONDS)
+    }
+
+    builder.build[QualifiedTableName, LogicalPlan]()
   }
 
   /** This method provides a way to get a cached plan. */
@@ -208,10 +220,18 @@ class SessionCatalog(
           "you cannot create a database with this name.")
     }
     validateName(dbName)
-    val qualifiedPath = makeQualifiedPath(dbDefinition.locationUri)
     externalCatalog.createDatabase(
-      dbDefinition.copy(name = dbName, locationUri = qualifiedPath),
+      dbDefinition.copy(name = dbName, locationUri = makeQualifiedDBPath(dbDefinition.locationUri)),
       ignoreIfExists)
+  }
+
+  private def makeQualifiedDBPath(locationUri: URI): URI = {
+    if (locationUri.isAbsolute) {
+      locationUri
+    } else {
+      val fullPath = new Path(conf.warehousePath, CatalogUtils.URIToString(locationUri))
+      makeQualifiedPath(fullPath.toUri)
+    }
   }
 
   def dropDatabase(db: String, ignoreIfNotExists: Boolean, cascade: Boolean): Unit = {
@@ -230,7 +250,8 @@ class SessionCatalog(
   def alterDatabase(dbDefinition: CatalogDatabase): Unit = {
     val dbName = formatDatabaseName(dbDefinition.name)
     requireDbExists(dbName)
-    externalCatalog.alterDatabase(dbDefinition.copy(name = dbName))
+    externalCatalog.alterDatabase(dbDefinition.copy(
+      name = dbName, locationUri = makeQualifiedDBPath(dbDefinition.locationUri)))
   }
 
   def getDatabaseMetadata(db: String): CatalogDatabase = {
@@ -272,8 +293,7 @@ class SessionCatalog(
    * by users.
    */
   def getDefaultDBPath(db: String): URI = {
-    val database = formatDatabaseName(db)
-    new Path(new Path(conf.warehousePath), database + ".db").toUri
+    CatalogUtils.stringToURI(formatDatabaseName(db) + ".db")
   }
 
   // ----------------------------------------------------------------------------
@@ -306,7 +326,7 @@ class SessionCatalog(
       && !tableDefinition.storage.locationUri.get.isAbsolute) {
       // make the location of the table qualified.
       val qualifiedTableLocation =
-        makeQualifiedPath(tableDefinition.storage.locationUri.get)
+        makeQualifiedTablePath(tableDefinition.storage.locationUri.get, db)
       tableDefinition.copy(
         storage = tableDefinition.storage.copy(locationUri = Some(qualifiedTableLocation)),
         identifier = tableIdentifier)
@@ -339,6 +359,16 @@ class SessionCatalog(
     }
   }
 
+  private def makeQualifiedTablePath(locationUri: URI, database: String): URI = {
+    if (locationUri.isAbsolute) {
+      locationUri
+    } else {
+      val dbName = formatDatabaseName(database)
+      val dbLocation = makeQualifiedDBPath(getDatabaseMetadata(dbName).locationUri)
+      new Path(new Path(dbLocation), CatalogUtils.URIToString(locationUri)).toUri
+    }
+  }
+
   /**
    * Alter the metadata of an existing metastore table identified by `tableDefinition`.
    *
@@ -358,7 +388,7 @@ class SessionCatalog(
       && !tableDefinition.storage.locationUri.get.isAbsolute) {
       // make the location of the table qualified.
       val qualifiedTableLocation =
-        makeQualifiedPath(tableDefinition.storage.locationUri.get)
+        makeQualifiedTablePath(tableDefinition.storage.locationUri.get, db)
       tableDefinition.copy(
         storage = tableDefinition.storage.copy(locationUri = Some(qualifiedTableLocation)),
         identifier = tableIdentifier)
@@ -754,10 +784,13 @@ class SessionCatalog(
     }
   }
 
-  def getRelation(metadata: CatalogTable): LogicalPlan = {
+  def getRelation(
+      metadata: CatalogTable,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): LogicalPlan = {
     val name = metadata.identifier
     val db = formatDatabaseName(name.database.getOrElse(currentDb))
     val table = formatTableName(name.table)
+    val multiParts = Seq(CatalogManager.SESSION_CATALOG_NAME, db, table)
 
     if (metadata.tableType == CatalogTableType.VIEW) {
       val viewText = metadata.viewText.getOrElse(sys.error("Invalid view without text."))
@@ -769,9 +802,9 @@ class SessionCatalog(
         desc = metadata,
         output = metadata.schema.toAttributes,
         child = parser.parsePlan(viewText))
-      SubqueryAlias(table, db, child)
+      SubqueryAlias(multiParts, child)
     } else {
-      SubqueryAlias(table, db, UnresolvedCatalogRelation(metadata))
+      SubqueryAlias(multiParts, UnresolvedCatalogRelation(metadata, options))
     }
   }
 
@@ -876,6 +909,25 @@ class SessionCatalog(
     } else {
       dbTables
     }
+  }
+
+  /**
+   * List all matching views in the specified database, including local temporary views.
+   */
+  def listViews(db: String, pattern: String): Seq[TableIdentifier] = {
+    val dbName = formatDatabaseName(db)
+    val dbViews = if (dbName == globalTempViewManager.database) {
+      globalTempViewManager.listViewNames(pattern).map { name =>
+        TableIdentifier(name, Some(globalTempViewManager.database))
+      }
+    } else {
+      requireDbExists(dbName)
+      externalCatalog.listViews(dbName, pattern).map { name =>
+        TableIdentifier(name, Some(dbName))
+      }
+    }
+
+    dbViews ++ listLocalTempViews(pattern)
   }
 
   /**
@@ -1318,6 +1370,14 @@ class SessionCatalog(
         makeFunctionBuilder(func.unquotedString, className)
       }
     functionRegistry.registerFunction(func, info, builder)
+  }
+
+  /**
+   * Unregister a temporary or permanent function from a session-specific [[FunctionRegistry]]
+   * Return true if function exists.
+   */
+  def unregisterFunction(name: FunctionIdentifier): Boolean = {
+    functionRegistry.dropFunction(name)
   }
 
   /**

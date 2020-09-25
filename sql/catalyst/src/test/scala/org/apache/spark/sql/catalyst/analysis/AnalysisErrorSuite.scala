@@ -208,11 +208,6 @@ class AnalysisErrorSuite extends AnalysisTest {
     "FILTER predicate specified, but aggregate is not an aggregate function" :: Nil)
 
   errorTest(
-    "DISTINCT aggregate function with filter predicate",
-    CatalystSqlParser.parsePlan("SELECT count(DISTINCT a) FILTER (WHERE c > 1) FROM TaBlE2"),
-    "DISTINCT and FILTER cannot be used in aggregate functions at the same time" :: Nil)
-
-  errorTest(
     "non-deterministic filter predicate in aggregate functions",
     CatalystSqlParser.parsePlan("SELECT count(a) FILTER (WHERE rand(int(c)) > 1) FROM TaBlE2"),
     "FILTER expression is non-deterministic, it cannot be used in aggregate functions" :: Nil)
@@ -237,6 +232,28 @@ class AnalysisErrorSuite extends AnalysisTest {
           SortOrder(UnresolvedAttribute("b"), Ascending) :: Nil,
           SpecifiedWindowFrame(RangeFrame, Literal(1), Literal(2)))).as("window")),
     "window frame" :: "must match the required frame" :: Nil)
+
+  errorTest(
+    "the offset of nth_value window function is negative or zero",
+    testRelation2.select(
+      WindowExpression(
+        new NthValue(AttributeReference("b", IntegerType)(), Literal(0)),
+        WindowSpecDefinition(
+          UnresolvedAttribute("a") :: Nil,
+          SortOrder(UnresolvedAttribute("b"), Ascending) :: Nil,
+          SpecifiedWindowFrame(RowFrame, Literal(0), Literal(0)))).as("window")),
+    "The 'offset' argument of nth_value must be greater than zero but it is 0." :: Nil)
+
+  errorTest(
+    "the offset of nth_value window function is not int literal",
+    testRelation2.select(
+      WindowExpression(
+        new NthValue(AttributeReference("b", IntegerType)(), Literal(true)),
+        WindowSpecDefinition(
+          UnresolvedAttribute("a") :: Nil,
+          SortOrder(UnresolvedAttribute("b"), Ascending) :: Nil,
+          SpecifiedWindowFrame(RowFrame, Literal(0), Literal(0)))).as("window")),
+    "argument 2 requires int type, however, 'true' is of boolean type." :: Nil)
 
   errorTest(
     "too many generators",
@@ -434,6 +451,32 @@ class AnalysisErrorSuite extends AnalysisTest {
   )
 
   errorTest(
+    "SPARK-30998: unsupported nested inner generators",
+    {
+      val nestedListRelation = LocalRelation(
+        AttributeReference("nestedList", ArrayType(ArrayType(IntegerType)))())
+      nestedListRelation.select(Explode(Explode($"nestedList")))
+    },
+    "Generators are not supported when it's nested in expressions, but got: " +
+      "explode(explode(nestedList))" :: Nil
+  )
+
+  errorTest(
+    "SPARK-30998: unsupported nested inner generators for aggregates",
+    testRelation.select(Explode(Explode(
+      CreateArray(CreateArray(min($"a") :: max($"a") :: Nil) :: Nil)))),
+    "Generators are not supported when it's nested in expressions, but got: " +
+      "explode(explode(array(array(min(a), max(a)))))" :: Nil
+  )
+
+  errorTest(
+    "generator nested in expressions for aggregates",
+    testRelation.select(Explode(CreateArray(min($"a") :: max($"a") :: Nil)) + 1),
+    "Generators are not supported when it's nested in expressions, but got: " +
+      "(explode(array(min(a), max(a))) + 1)" :: Nil
+  )
+
+  errorTest(
     "generator appears in operator which is not Project",
     listRelation.sortBy(Explode($"list").asc),
     "Generators are not supported outside the SELECT clause, but got: Sort" :: Nil
@@ -455,6 +498,14 @@ class AnalysisErrorSuite extends AnalysisTest {
     "more than one generators in SELECT",
     listRelation.select(Explode($"list"), Explode($"list")),
     "Only one generator allowed per select clause but found 2: explode(list), explode(list)" :: Nil
+  )
+
+  errorTest(
+    "more than one generators for aggregates in SELECT",
+    testRelation.select(Explode(CreateArray(min($"a") :: Nil)),
+      Explode(CreateArray(max($"a") :: Nil))),
+    "Only one generator allowed per select clause but found 2: " +
+      "explode(array(min(a))), explode(array(max(a)))" :: Nil
   )
 
   test("SPARK-6452 regression test") {
@@ -578,21 +629,6 @@ class AnalysisErrorSuite extends AnalysisTest {
       LocalRelation(a))
     assertAnalysisError(plan, "Predicate sub-queries can only be used" +
         " in Filter" :: Nil)
-  }
-
-  test("PredicateSubQuery is used is a nested condition") {
-    val a = AttributeReference("a", IntegerType)()
-    val b = AttributeReference("b", IntegerType)()
-    val c = AttributeReference("c", BooleanType)()
-    val plan1 = Filter(Cast(Not(InSubquery(Seq(a), ListQuery(LocalRelation(b)))), BooleanType),
-      LocalRelation(a))
-    assertAnalysisError(plan1,
-      "Null-aware predicate sub-queries cannot be used in nested conditions" :: Nil)
-
-    val plan2 = Filter(
-      Or(Not(InSubquery(Seq(a), ListQuery(LocalRelation(b)))), c), LocalRelation(a, c))
-    assertAnalysisError(plan2,
-      "Null-aware predicate sub-queries cannot be used in nested conditions" :: Nil)
   }
 
   test("PredicateSubQuery correlated predicate is nested in an illegal plan") {

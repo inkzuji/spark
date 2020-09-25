@@ -77,6 +77,19 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     }
   }
 
+  test("string to interval: interval with dangling parts should not results null") {
+    checkFromInvalidString("+", "expect a number after '+' but hit EOL")
+    checkFromInvalidString("-", "expect a number after '-' but hit EOL")
+    checkFromInvalidString("+ 2", "expect a unit name after '2' but hit EOL")
+    checkFromInvalidString("- 1", "expect a unit name after '1' but hit EOL")
+    checkFromInvalidString("1", "expect a unit name after '1' but hit EOL")
+    checkFromInvalidString("1.2", "expect a unit name after '1.2' but hit EOL")
+    checkFromInvalidString("1 day 2", "expect a unit name after '2' but hit EOL")
+    checkFromInvalidString("1 day 2.2", "expect a unit name after '2.2' but hit EOL")
+    checkFromInvalidString("1 day -", "expect a number after '-' but hit EOL")
+    checkFromInvalidString("-.", "expect a unit name after '-.' but hit EOL")
+  }
+
   test("string to interval: multiple units") {
     Seq(
       "-1 MONTH 1 day -1 microseconds" -> new CalendarInterval(-1, 1, -1),
@@ -115,6 +128,14 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     checkFromString("1 \t day \n 2 \r hour", new CalendarInterval(0, 1, 2 * MICROS_PER_HOUR))
     checkFromInvalidString("interval1 \t day \n 2 \r hour", "invalid interval prefix interval1")
     checkFromString("interval\r1\tday", new CalendarInterval(0, 1, 0))
+    // scalastyle:off nonascii
+    checkFromInvalidString("中国 interval 1 day", "unrecognized number '中国'")
+    checkFromInvalidString("interval浙江 1 day", "invalid interval prefix interval浙江")
+    checkFromInvalidString("interval 1杭州 day", "invalid value '1杭州'")
+    checkFromInvalidString("interval 1 滨江day", "invalid unit '滨江day'")
+    checkFromInvalidString("interval 1 day长河", "invalid unit 'day长河'")
+    checkFromInvalidString("interval 1 day 网商路", "unrecognized number '网商路'")
+    // scalastyle:on nonascii
   }
 
   test("string to interval: seconds with fractional part") {
@@ -136,6 +157,15 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     assert(fromYearMonthString("-8-10") === new CalendarInterval(-8 * 12 - 10, 0, 0L))
     failFuncWithInvalidInput("99-15", "month 15 outside range", fromYearMonthString)
     failFuncWithInvalidInput("9a9-15", "Interval string does not match year-month format",
+      fromYearMonthString)
+
+    // whitespaces
+    assert(fromYearMonthString("99-10 ") === new CalendarInterval(99 * 12 + 10, 0, 0L))
+    assert(fromYearMonthString("+99-10\t") === new CalendarInterval(99 * 12 + 10, 0, 0L))
+    assert(fromYearMonthString("\t\t-8-10\t") === new CalendarInterval(-8 * 12 - 10, 0, 0L))
+    failFuncWithInvalidInput("99\t-15", "Interval string does not match year-month format",
+      fromYearMonthString)
+    failFuncWithInvalidInput("-\t99-15", "Interval string does not match year-month format",
       fromYearMonthString)
   }
 
@@ -312,6 +342,11 @@ class IntervalUtilsSuite extends SparkFunSuite with SQLHelper {
     checkFail("5 30:12:20", DAY, SECOND, "hour 30 outside range")
     checkFail("5 30-12", DAY, SECOND, "must match day-time format")
     checkFail("5 1:12:20", HOUR, MICROSECOND, "Cannot support (interval")
+
+    // whitespaces
+    check("\t +5 12:40\t ", DAY, MINUTE, "5 days 12 hours 40 minutes")
+    checkFail("+5\t 12:40", DAY, MINUTE, "must match day-time format")
+
   }
 
   test("interval overflow check") {

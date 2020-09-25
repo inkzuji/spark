@@ -42,7 +42,6 @@ import org.apache.hadoop.mapreduce.lib.input.{FileInputFormat => NewFileInputFor
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.{LocalSparkCluster, SparkHadoopUtil}
-import org.apache.spark.deploy.StandaloneResourceUtils._
 import org.apache.spark.executor.{ExecutorMetrics, ExecutorMetricsSource}
 import org.apache.spark.input.{FixedLengthBinaryInputFormat, PortableDataStream, StreamInputFormat, WholeTextFileInputFormat}
 import org.apache.spark.internal.Logging
@@ -83,6 +82,11 @@ class SparkContext(config: SparkConf) extends Logging {
 
   // The call site where this SparkContext was constructed.
   private val creationSite: CallSite = Utils.getCallSite()
+
+  if (!config.get(EXECUTOR_ALLOW_SPARK_CONTEXT)) {
+    // In order to prevent SparkContext from being created in executors.
+    SparkContext.assertOnDriver()
+  }
 
   // In order to prevent multiple SparkContexts from being active at the same time, mark this
   // context as having started construction.
@@ -252,15 +256,6 @@ class SparkContext(config: SparkConf) extends Logging {
 
   def isLocal: Boolean = Utils.isLocalMaster(_conf)
 
-  private def isClientStandalone: Boolean = {
-    val isSparkCluster = master match {
-      case SparkMasterRegex.SPARK_REGEX(_) => true
-      case SparkMasterRegex.LOCAL_CLUSTER_REGEX(_, _, _) => true
-      case _ => false
-    }
-    deployMode == "client" && isSparkCluster
-  }
-
   /**
    * @return true if context is stopped or in the midst of stopping.
    */
@@ -389,6 +384,7 @@ class SparkContext(config: SparkConf) extends Logging {
   try {
     _conf = config.clone()
     _conf.validateSettings()
+    _conf.set("spark.app.startTime", startTime.toString)
 
     if (!_conf.contains("spark.master")) {
       throw new SparkException("A master URL must be set in your configuration")
@@ -400,17 +396,7 @@ class SparkContext(config: SparkConf) extends Logging {
     _driverLogger = DriverLogger(_conf)
 
     val resourcesFileOpt = conf.get(DRIVER_RESOURCES_FILE)
-    val allResources = getOrDiscoverAllResources(_conf, SPARK_DRIVER_PREFIX, resourcesFileOpt)
-    _resources = {
-      // driver submitted in client mode under Standalone may have conflicting resources with
-      // other drivers/workers on this host. We should sync driver's resources info into
-      // SPARK_RESOURCES/SPARK_RESOURCES_COORDINATE_DIR/ to avoid collision.
-      if (isClientStandalone) {
-        acquireResources(_conf, SPARK_DRIVER_PREFIX, allResources, Utils.getProcessId)
-      } else {
-        allResources
-      }
-    }
+    _resources = getOrDiscoverAllResources(_conf, SPARK_DRIVER_PREFIX, resourcesFileOpt)
     logResourceInfo(SPARK_DRIVER_PREFIX, _resources)
 
     // log out spark.app.name in the Spark driver logs
@@ -455,7 +441,7 @@ class SparkContext(config: SparkConf) extends Logging {
     }
 
     _listenerBus = new LiveListenerBus(_conf)
-    _resourceProfileManager = new ResourceProfileManager(_conf)
+    _resourceProfileManager = new ResourceProfileManager(_conf, _listenerBus)
 
     // Initialize the app status store and listener before SparkEnv is created so that it gets
     // all events.
@@ -507,11 +493,17 @@ class SparkContext(config: SparkConf) extends Logging {
 
     // Add each JAR given through the constructor
     if (jars != null) {
-      jars.foreach(addJar)
+      jars.foreach(jar => addJar(jar, true))
+      if (addedJars.nonEmpty) {
+        _conf.set("spark.app.initial.jar.urls", addedJars.keys.toSeq.mkString(","))
+      }
     }
 
     if (files != null) {
-      files.foreach(addFile)
+      files.foreach(file => addFile(file, false, true))
+      if (addedFiles.nonEmpty) {
+        _conf.set("spark.app.initial.file.urls", addedFiles.keys.toSeq.mkString(","))
+      }
     }
 
     _executorMemory = _conf.getOption(EXECUTOR_MEMORY.key)
@@ -1515,7 +1507,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * @note A path can be added only once. Subsequent additions of the same path are ignored.
    */
   def addFile(path: String): Unit = {
-    addFile(path, false)
+    addFile(path, false, false)
   }
 
   /**
@@ -1537,6 +1529,10 @@ class SparkContext(config: SparkConf) extends Logging {
    * @note A path can be added only once. Subsequent additions of the same path are ignored.
    */
   def addFile(path: String, recursive: Boolean): Unit = {
+    addFile(path, recursive, false)
+  }
+
+  private def addFile(path: String, recursive: Boolean, addedOnSubmit: Boolean): Unit = {
     val uri = new Path(path).toUri
     val schemeCorrectedURI = uri.getScheme match {
       case null => new File(path).getCanonicalFile.toURI
@@ -1574,7 +1570,7 @@ class SparkContext(config: SparkConf) extends Logging {
           path
         }
     }
-    val timestamp = System.currentTimeMillis
+    val timestamp = if (addedOnSubmit) startTime else System.currentTimeMillis
     if (addedFiles.putIfAbsent(key, timestamp).isEmpty) {
       logInfo(s"Added file $path at $key with timestamp $timestamp")
       // Fetch the file locally so that closures which are run on the driver can still use the
@@ -1584,7 +1580,7 @@ class SparkContext(config: SparkConf) extends Logging {
       postEnvironmentUpdate()
     } else {
       logWarning(s"The path $path has been added already. Overwriting of added paths " +
-       "is not supported in the current version.")
+        "is not supported in the current version.")
     }
   }
 
@@ -1617,13 +1613,17 @@ class SparkContext(config: SparkConf) extends Logging {
   }
 
   /**
-   * Get the max number of tasks that can be concurrent launched currently.
+   * Get the max number of tasks that can be concurrent launched based on the ResourceProfile
+   * could be used, even if some of them are being used at the moment.
    * Note that please don't cache the value returned by this method, because the number can change
    * due to add/remove executors.
    *
+   * @param rp ResourceProfile which to use to calculate max concurrent tasks.
    * @return The max number of tasks that can be concurrent launched currently.
    */
-  private[spark] def maxNumConcurrentTasks(): Int = schedulerBackend.maxNumConcurrentTasks()
+  private[spark] def maxNumConcurrentTasks(rp: ResourceProfile): Int = {
+    schedulerBackend.maxNumConcurrentTasks(rp)
+  }
 
   /**
    * Update the cluster manager on our scheduling needs. Three bits of information are included
@@ -1745,7 +1745,7 @@ class SparkContext(config: SparkConf) extends Logging {
   def version: String = SPARK_VERSION
 
   /**
-   * Return a map from the slave to the max memory available for caching and the remaining
+   * Return a map from the block manager to the max memory available for caching and the remaining
    * memory available for caching.
    */
   def getExecutorMemoryStatus: Map[String, (Long, Long)] = {
@@ -1851,6 +1851,10 @@ class SparkContext(config: SparkConf) extends Logging {
    * @note A path can be added only once. Subsequent additions of the same path are ignored.
    */
   def addJar(path: String): Unit = {
+    addJar(path, false)
+  }
+
+  private def addJar(path: String, addedOnSubmit: Boolean): Unit = {
     def addLocalJarFile(file: File): String = {
       try {
         if (!file.exists()) {
@@ -1877,7 +1881,7 @@ class SparkContext(config: SparkConf) extends Logging {
           if (!fs.exists(hadoopPath)) {
             throw new FileNotFoundException(s"Jar ${path} not found")
           }
-          if (fs.isDirectory(hadoopPath)) {
+          if (fs.getFileStatus(hadoopPath).isDirectory) {
             throw new IllegalArgumentException(
               s"Directory ${path} is not allowed for addJar")
           }
@@ -1915,7 +1919,7 @@ class SparkContext(config: SparkConf) extends Logging {
         }
       }
       if (key != null) {
-        val timestamp = System.currentTimeMillis
+        val timestamp = if (addedOnSubmit) startTime else System.currentTimeMillis
         if (addedJars.putIfAbsent(key, timestamp).isEmpty) {
           logInfo(s"Added JAR $path at $key with timestamp $timestamp")
           postEnvironmentUpdate()
@@ -2028,9 +2032,6 @@ class SparkContext(config: SparkConf) extends Logging {
     }
     Utils.tryLogNonFatalError {
       _progressBar.foreach(_.stop())
-    }
-    if (isClientStandalone) {
-      releaseResources(_conf, SPARK_DRIVER_PREFIX, _resources, Utils.getProcessId)
     }
     _taskScheduler = null
     // TODO: Cache.stop()?
@@ -2574,6 +2575,19 @@ object SparkContext extends Logging {
   }
 
   /**
+   * Called to ensure that SparkContext is created or accessed only on the Driver.
+   *
+   * Throws an exception if a SparkContext is about to be created in executors.
+   */
+  private def assertOnDriver(): Unit = {
+    if (TaskContext.get != null) {
+      // we're accessing it during task execution, fail.
+      throw new IllegalStateException(
+        "SparkContext should only be created and accessed on the driver.")
+    }
+  }
+
+  /**
    * This function may be used to get or instantiate a SparkContext and register it as a
    * singleton object. Because we can only have one active SparkContext per JVM,
    * this is useful when applications may wish to share a SparkContext.
@@ -2759,7 +2773,7 @@ object SparkContext extends Logging {
       case "local" => 1
       case SparkMasterRegex.LOCAL_N_REGEX(threads) => convertToInt(threads)
       case SparkMasterRegex.LOCAL_N_FAILURES_REGEX(threads, _) => convertToInt(threads)
-      case "yarn" =>
+      case "yarn" | SparkMasterRegex.KUBERNETES_REGEX(_) =>
         if (conf != null && conf.get(SUBMIT_DEPLOY_MODE) == "cluster") {
           conf.getInt(DRIVER_CORES.key, 0)
         } else {
@@ -2787,23 +2801,10 @@ object SparkContext extends Logging {
     // others its checked in ResourceProfile.
     def checkResourcesPerTask(executorCores: Int): Unit = {
       val taskCores = sc.conf.get(CPUS_PER_TASK)
-      validateTaskCpusLargeEnough(executorCores, taskCores)
-      val defaultProf = sc.resourceProfileManager.defaultResourceProfile
-      // TODO - this is temporary until all of stage level scheduling feature is integrated,
-      // fail if any other resource limiting due to dynamic allocation and scheduler using
-      // slots based on cores
-      val cpuSlots = executorCores/taskCores
-      val limitingResource = defaultProf.limitingResource(sc.conf)
-      if (limitingResource.nonEmpty && !limitingResource.equals(ResourceProfile.CPUS) &&
-        defaultProf.maxTasksPerExecutor(sc.conf) < cpuSlots) {
-        throw new IllegalArgumentException("The number of slots on an executor has to be " +
-          "limited by the number of cores, otherwise you waste resources and " +
-          "some scheduling doesn't work properly. Your configuration has " +
-          s"core/task cpu slots = ${cpuSlots} and " +
-          s"${limitingResource} = " +
-          s"${defaultProf.maxTasksPerExecutor(sc.conf)}. Please adjust your configuration " +
-          "so that all resources require same number of executor slots.")
+      if (!sc.conf.get(SKIP_VALIDATE_CORES_TESTING)) {
+        validateTaskCpusLargeEnough(sc.conf, executorCores, taskCores)
       }
+      val defaultProf = sc.resourceProfileManager.defaultResourceProfile
       ResourceUtils.warnOnWastedResources(defaultProf, sc.conf, Some(executorCores))
     }
 
@@ -2846,14 +2847,14 @@ object SparkContext extends Logging {
         scheduler.initialize(backend)
         (backend, scheduler)
 
-      case LOCAL_CLUSTER_REGEX(numSlaves, coresPerSlave, memoryPerSlave) =>
-        checkResourcesPerTask(coresPerSlave.toInt)
-        // Check to make sure memory requested <= memoryPerSlave. Otherwise Spark will just hang.
-        val memoryPerSlaveInt = memoryPerSlave.toInt
-        if (sc.executorMemory > memoryPerSlaveInt) {
+      case LOCAL_CLUSTER_REGEX(numWorkers, coresPerWorker, memoryPerWorker) =>
+        checkResourcesPerTask(coresPerWorker.toInt)
+        // Check to make sure memory requested <= memoryPerWorker. Otherwise Spark will just hang.
+        val memoryPerWorkerInt = memoryPerWorker.toInt
+        if (sc.executorMemory > memoryPerWorkerInt) {
           throw new SparkException(
             "Asked to launch cluster with %d MiB RAM / worker but requested %d MiB/worker".format(
-              memoryPerSlaveInt, sc.executorMemory))
+              memoryPerWorkerInt, sc.executorMemory))
         }
 
         // For host local mode setting the default of SHUFFLE_HOST_LOCAL_DISK_READING_ENABLED
@@ -2866,7 +2867,7 @@ object SparkContext extends Logging {
 
         val scheduler = new TaskSchedulerImpl(sc)
         val localCluster = new LocalSparkCluster(
-          numSlaves.toInt, coresPerSlave.toInt, memoryPerSlaveInt, sc.conf)
+          numWorkers.toInt, coresPerWorker.toInt, memoryPerWorkerInt, sc.conf)
         val masterUrls = localCluster.start()
         val backend = new StandaloneSchedulerBackend(scheduler, sc, masterUrls)
         scheduler.initialize(backend)
@@ -2917,6 +2918,8 @@ private object SparkMasterRegex {
   val LOCAL_CLUSTER_REGEX = """local-cluster\[\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*]""".r
   // Regular expression for connecting to Spark deploy clusters
   val SPARK_REGEX = """spark://(.*)""".r
+  // Regular expression for connecting to kubernetes clusters
+  val KUBERNETES_REGEX = """k8s://(.*)""".r
 }
 
 /**

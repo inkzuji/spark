@@ -32,14 +32,13 @@ __all__ = ['Evaluator', 'BinaryClassificationEvaluator', 'RegressionEvaluator',
 
 
 @inherit_doc
-class Evaluator(Params):
+class Evaluator(Params, metaclass=ABCMeta):
     """
     Base class for evaluators that compute metrics from predictions.
 
     .. versionadded:: 1.4.0
     """
-
-    __metaclass__ = ABCMeta
+    pass
 
     @abstractmethod
     def _evaluate(self, dataset):
@@ -84,13 +83,11 @@ class Evaluator(Params):
 
 
 @inherit_doc
-class JavaEvaluator(JavaParams, Evaluator):
+class JavaEvaluator(JavaParams, Evaluator, metaclass=ABCMeta):
     """
     Base class for :py:class:`Evaluator`s that wrap Java/Scala
     implementations.
     """
-
-    __metaclass__ = ABCMeta
 
     def _evaluate(self, dataset):
         """
@@ -110,7 +107,8 @@ class JavaEvaluator(JavaParams, Evaluator):
 class BinaryClassificationEvaluator(JavaEvaluator, HasLabelCol, HasRawPredictionCol, HasWeightCol,
                                     JavaMLReadable, JavaMLWritable):
     """
-    Evaluator for binary classification, which expects two input columns: rawPrediction and label.
+    Evaluator for binary classification, which expects input columns rawPrediction, label
+    and an optional weight column.
     The rawPrediction column can be of type double (binary 0/1 prediction, or probability of label
     1) or of type vector (length-2 vector of raw predictions, scores, or label probabilities).
 
@@ -157,10 +155,10 @@ class BinaryClassificationEvaluator(JavaEvaluator, HasLabelCol, HasRawPrediction
                     typeConverter=TypeConverters.toInt)
 
     @keyword_only
-    def __init__(self, rawPredictionCol="rawPrediction", labelCol="label",
+    def __init__(self, *, rawPredictionCol="rawPrediction", labelCol="label",
                  metricName="areaUnderROC", weightCol=None, numBins=1000):
         """
-        __init__(self, rawPredictionCol="rawPrediction", labelCol="label", \
+        __init__(self, \\*, rawPredictionCol="rawPrediction", labelCol="label", \
                  metricName="areaUnderROC", weightCol=None, numBins=1000)
         """
         super(BinaryClassificationEvaluator, self).__init__()
@@ -219,10 +217,10 @@ class BinaryClassificationEvaluator(JavaEvaluator, HasLabelCol, HasRawPrediction
 
     @keyword_only
     @since("1.4.0")
-    def setParams(self, rawPredictionCol="rawPrediction", labelCol="label",
+    def setParams(self, *, rawPredictionCol="rawPrediction", labelCol="label",
                   metricName="areaUnderROC", weightCol=None, numBins=1000):
         """
-        setParams(self, rawPredictionCol="rawPrediction", labelCol="label", \
+        setParams(self, \\*, rawPredictionCol="rawPrediction", labelCol="label", \
                   metricName="areaUnderROC", weightCol=None, numBins=1000)
         Sets params for binary classification evaluator.
         """
@@ -281,10 +279,10 @@ class RegressionEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol, HasWeigh
                           typeConverter=TypeConverters.toBoolean)
 
     @keyword_only
-    def __init__(self, predictionCol="prediction", labelCol="label",
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
                  metricName="rmse", weightCol=None, throughOrigin=False):
         """
-        __init__(self, predictionCol="prediction", labelCol="label", \
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="rmse", weightCol=None, throughOrigin=False)
         """
         super(RegressionEvaluator, self).__init__()
@@ -343,10 +341,10 @@ class RegressionEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol, HasWeigh
 
     @keyword_only
     @since("1.4.0")
-    def setParams(self, predictionCol="prediction", labelCol="label",
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
                   metricName="rmse", weightCol=None, throughOrigin=False):
         """
-        setParams(self, predictionCol="prediction", labelCol="label", \
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
                   metricName="rmse", weightCol=None, throughOrigin=False)
         Sets params for regression evaluator.
         """
@@ -409,9 +407,9 @@ class MulticlassClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
     """
     metricName = Param(Params._dummy(), "metricName",
                        "metric name in evaluation "
-                       "(f1|accuracy|weightedPrecision|weightedRecall|weightedTruePositiveRate|"
-                       "weightedFalsePositiveRate|weightedFMeasure|truePositiveRateByLabel|"
-                       "falsePositiveRateByLabel|precisionByLabel|recallByLabel|fMeasureByLabel|"
+                       "(f1|accuracy|weightedPrecision|weightedRecall|weightedTruePositiveRate| "
+                       "weightedFalsePositiveRate|weightedFMeasure|truePositiveRateByLabel| "
+                       "falsePositiveRateByLabel|precisionByLabel|recallByLabel|fMeasureByLabel| "
                        "logLoss|hammingLoss)",
                        typeConverter=TypeConverters.toString)
     metricLabel = Param(Params._dummy(), "metricLabel",
@@ -430,11 +428,11 @@ class MulticlassClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
                 typeConverter=TypeConverters.toFloat)
 
     @keyword_only
-    def __init__(self, predictionCol="prediction", labelCol="label",
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
                  metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0,
                  probabilityCol="probability", eps=1e-15):
         """
-        __init__(self, predictionCol="prediction", labelCol="label", \
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0, \
                  probabilityCol="probability", eps=1e-15)
         """
@@ -529,11 +527,11 @@ class MulticlassClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
 
     @keyword_only
     @since("1.5.0")
-    def setParams(self, predictionCol="prediction", labelCol="label",
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
                   metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0,
                   probabilityCol="probability", eps=1e-15):
         """
-        setParams(self, predictionCol="prediction", labelCol="label", \
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
                   metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0, \
                   probabilityCol="probability", eps=1e-15)
         Sets params for multiclass classification evaluator.
@@ -584,10 +582,10 @@ class MultilabelClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
                         typeConverter=TypeConverters.toFloat)
 
     @keyword_only
-    def __init__(self, predictionCol="prediction", labelCol="label",
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
                  metricName="f1Measure", metricLabel=0.0):
         """
-        __init__(self, predictionCol="prediction", labelCol="label", \
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="f1Measure", metricLabel=0.0)
         """
         super(MultilabelClassificationEvaluator, self).__init__()
@@ -641,10 +639,10 @@ class MultilabelClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
 
     @keyword_only
     @since("3.0.0")
-    def setParams(self, predictionCol="prediction", labelCol="label",
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
                   metricName="f1Measure", metricLabel=0.0):
         """
-        setParams(self, predictionCol="prediction", labelCol="label", \
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
                   metricName="f1Measure", metricLabel=0.0)
         Sets params for multilabel classification evaluator.
         """
@@ -653,7 +651,7 @@ class MultilabelClassificationEvaluator(JavaEvaluator, HasLabelCol, HasPredictio
 
 
 @inherit_doc
-class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol,
+class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol, HasWeightCol,
                           JavaMLReadable, JavaMLWritable):
     """
     Evaluator for Clustering results, which expects two input
@@ -676,6 +674,18 @@ class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol,
     ClusteringEvaluator...
     >>> evaluator.evaluate(dataset)
     0.9079...
+    >>> featureAndPredictionsWithWeight = map(lambda x: (Vectors.dense(x[0]), x[1], x[2]),
+    ...     [([0.0, 0.5], 0.0, 2.5), ([0.5, 0.0], 0.0, 2.5), ([10.0, 11.0], 1.0, 2.5),
+    ...     ([10.5, 11.5], 1.0, 2.5), ([1.0, 1.0], 0.0, 2.5), ([8.0, 6.0], 1.0, 2.5)])
+    >>> dataset = spark.createDataFrame(
+    ...     featureAndPredictionsWithWeight, ["features", "prediction", "weight"])
+    >>> evaluator = ClusteringEvaluator()
+    >>> evaluator.setPredictionCol("prediction")
+    ClusteringEvaluator...
+    >>> evaluator.setWeightCol("weight")
+    ClusteringEvaluator...
+    >>> evaluator.evaluate(dataset)
+    0.9079...
     >>> ce_path = temp_path + "/ce"
     >>> evaluator.save(ce_path)
     >>> evaluator2 = ClusteringEvaluator.load(ce_path)
@@ -692,11 +702,11 @@ class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol,
                             typeConverter=TypeConverters.toString)
 
     @keyword_only
-    def __init__(self, predictionCol="prediction", featuresCol="features",
-                 metricName="silhouette", distanceMeasure="squaredEuclidean"):
+    def __init__(self, *, predictionCol="prediction", featuresCol="features",
+                 metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None):
         """
-        __init__(self, predictionCol="prediction", featuresCol="features", \
-                 metricName="silhouette", distanceMeasure="squaredEuclidean")
+        __init__(self, \\*, predictionCol="prediction", featuresCol="features", \
+                 metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None)
         """
         super(ClusteringEvaluator, self).__init__()
         self._java_obj = self._new_java_obj(
@@ -707,11 +717,11 @@ class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol,
 
     @keyword_only
     @since("2.3.0")
-    def setParams(self, predictionCol="prediction", featuresCol="features",
-                  metricName="silhouette", distanceMeasure="squaredEuclidean"):
+    def setParams(self, *, predictionCol="prediction", featuresCol="features",
+                  metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None):
         """
-        setParams(self, predictionCol="prediction", featuresCol="features", \
-                  metricName="silhouette", distanceMeasure="squaredEuclidean")
+        setParams(self, \\*, predictionCol="prediction", featuresCol="features", \
+                  metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None)
         Sets params for clustering evaluator.
         """
         kwargs = self._input_kwargs
@@ -757,6 +767,13 @@ class ClusteringEvaluator(JavaEvaluator, HasPredictionCol, HasFeaturesCol,
         """
         return self._set(predictionCol=value)
 
+    @since("3.1.0")
+    def setWeightCol(self, value):
+        """
+        Sets the value of :py:attr:`weightCol`.
+        """
+        return self._set(weightCol=value)
+
 
 @inherit_doc
 class RankingEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol,
@@ -799,10 +816,10 @@ class RankingEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol,
               typeConverter=TypeConverters.toInt)
 
     @keyword_only
-    def __init__(self, predictionCol="prediction", labelCol="label",
+    def __init__(self, *, predictionCol="prediction", labelCol="label",
                  metricName="meanAveragePrecision", k=10):
         """
-        __init__(self, predictionCol="prediction", labelCol="label", \
+        __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="meanAveragePrecision", k=10)
         """
         super(RankingEvaluator, self).__init__()
@@ -856,10 +873,10 @@ class RankingEvaluator(JavaEvaluator, HasLabelCol, HasPredictionCol,
 
     @keyword_only
     @since("3.0.0")
-    def setParams(self, predictionCol="prediction", labelCol="label",
+    def setParams(self, *, predictionCol="prediction", labelCol="label",
                   metricName="meanAveragePrecision", k=10):
         """
-        setParams(self, predictionCol="prediction", labelCol="label", \
+        setParams(self, \\*, predictionCol="prediction", labelCol="label", \
                   metricName="meanAveragePrecision", k=10)
         Sets params for ranking evaluator.
         """

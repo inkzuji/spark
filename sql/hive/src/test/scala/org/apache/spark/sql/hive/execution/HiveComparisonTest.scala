@@ -345,9 +345,7 @@ abstract class HiveComparisonTest extends SparkFunSuite with BeforeAndAfterAll {
         val catalystResults = queryList.zip(hiveResults).map { case (queryString, hive) =>
           val query = new TestHiveQueryExecution(queryString.replace("../../data", testDataPath))
           def getResult(): Seq[String] = {
-            SQLExecution.withNewExecutionId(query) {
-              hiveResultString(Dataset.ofRows(query.sparkSession, query.logical))
-            }
+            SQLExecution.withNewExecutionId(query)(hiveResultString(query.executedPlan))
           }
           try { (query, prepareAnswer(query, getResult())) } catch {
             case e: Throwable =>
@@ -373,8 +371,8 @@ abstract class HiveComparisonTest extends SparkFunSuite with BeforeAndAfterAll {
 
             // We will ignore the ExplainCommand, ShowFunctions, DescribeFunction
             if ((!hiveQuery.logical.isInstanceOf[ExplainCommand]) &&
-                (!hiveQuery.logical.isInstanceOf[ShowFunctionsStatement]) &&
-                (!hiveQuery.logical.isInstanceOf[DescribeFunctionStatement]) &&
+                (!hiveQuery.logical.isInstanceOf[ShowFunctions]) &&
+                (!hiveQuery.logical.isInstanceOf[DescribeFunction]) &&
                 (!hiveQuery.logical.isInstanceOf[DescribeCommandBase]) &&
                 (!hiveQuery.logical.isInstanceOf[DescribeRelation]) &&
                 (!hiveQuery.logical.isInstanceOf[DescribeColumnStatement]) &&

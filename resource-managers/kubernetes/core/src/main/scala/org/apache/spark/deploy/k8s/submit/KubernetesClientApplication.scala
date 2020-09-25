@@ -20,16 +20,20 @@ import java.io.StringWriter
 import java.util.{Collections, UUID}
 import java.util.Properties
 
-import io.fabric8.kubernetes.api.model._
-import io.fabric8.kubernetes.client.KubernetesClient
 import scala.collection.mutable
+import scala.util.control.Breaks._
 import scala.util.control.NonFatal
+
+import io.fabric8.kubernetes.api.model._
+import io.fabric8.kubernetes.client.{KubernetesClient, Watch}
+import io.fabric8.kubernetes.client.Watcher.Action
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkApplication
 import org.apache.spark.deploy.k8s._
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
+import org.apache.spark.deploy.k8s.KubernetesUtils.addOwnerReference
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
 
@@ -43,7 +47,8 @@ import org.apache.spark.util.Utils
 private[spark] case class ClientArguments(
     mainAppResource: MainAppResource,
     mainClass: String,
-    driverArgs: Array[String])
+    driverArgs: Array[String],
+    proxyUser: Option[String])
 
 private[spark] object ClientArguments {
 
@@ -51,6 +56,7 @@ private[spark] object ClientArguments {
     var mainAppResource: MainAppResource = JavaMainAppResource(None)
     var mainClass: Option[String] = None
     val driverArgs = mutable.ArrayBuffer.empty[String]
+    var proxyUser: Option[String] = None
 
     args.sliding(2, 2).toList.foreach {
       case Array("--primary-java-resource", primaryJavaResource: String) =>
@@ -63,6 +69,8 @@ private[spark] object ClientArguments {
         mainClass = Some(clazz)
       case Array("--arg", arg: String) =>
         driverArgs += arg
+      case Array("--proxy-user", user: String) =>
+        proxyUser = Some(user)
       case other =>
         val invalid = other.mkString(" ")
         throw new RuntimeException(s"Unknown arguments: $invalid")
@@ -73,7 +81,8 @@ private[spark] object ClientArguments {
     ClientArguments(
       mainAppResource,
       mainClass.get,
-      driverArgs.toArray)
+      driverArgs.toArray,
+      proxyUser)
   }
 }
 
@@ -122,41 +131,37 @@ private[spark] class Client(
         .endSpec()
       .build()
     val driverPodName = resolvedDriverPod.getMetadata.getName
-    Utils.tryWithResource(
-      kubernetesClient
-        .pods()
-        .withName(driverPodName)
-        .watch(watcher)) { _ =>
-      val createdDriverPod = kubernetesClient.pods().create(resolvedDriverPod)
-      try {
-        val otherKubernetesResources =
-          resolvedDriverSpec.driverKubernetesResources ++ Seq(configMap)
-        addDriverOwnerReference(createdDriverPod, otherKubernetesResources)
-        kubernetesClient.resourceList(otherKubernetesResources: _*).createOrReplace()
-      } catch {
-        case NonFatal(e) =>
-          kubernetesClient.pods().delete(createdDriverPod)
-          throw e
-      }
 
-      val sId = Seq(conf.namespace, driverPodName).mkString(":")
-      watcher.watchOrStop(sId)
+    var watch: Watch = null
+    val createdDriverPod = kubernetesClient.pods().create(resolvedDriverPod)
+    try {
+      val otherKubernetesResources = resolvedDriverSpec.driverKubernetesResources ++ Seq(configMap)
+      addOwnerReference(createdDriverPod, otherKubernetesResources)
+      kubernetesClient.resourceList(otherKubernetesResources: _*).createOrReplace()
+    } catch {
+      case NonFatal(e) =>
+        kubernetesClient.pods().delete(createdDriverPod)
+        throw e
     }
-  }
+    val sId = Seq(conf.namespace, driverPodName).mkString(":")
+    breakable {
+      while (true) {
+        val podWithName = kubernetesClient
+          .pods()
+          .withName(driverPodName)
+        // Reset resource to old before we start the watch, this is important for race conditions
+        watcher.reset()
+        watch = podWithName.watch(watcher)
 
-  // Add a OwnerReference to the given resources making the driver pod an owner of them so when
-  // the driver pod is deleted, the resources are garbage collected.
-  private def addDriverOwnerReference(driverPod: Pod, resources: Seq[HasMetadata]): Unit = {
-    val driverPodOwnerReference = new OwnerReferenceBuilder()
-      .withName(driverPod.getMetadata.getName)
-      .withApiVersion(driverPod.getApiVersion)
-      .withUid(driverPod.getMetadata.getUid)
-      .withKind(driverPod.getKind)
-      .withController(true)
-      .build()
-    resources.foreach { resource =>
-      val originalMetadata = resource.getMetadata
-      originalMetadata.setOwnerReferences(Collections.singletonList(driverPodOwnerReference))
+        // Send the latest pod state we know to the watcher to make sure we didn't miss anything
+        watcher.eventReceived(Action.MODIFIED, podWithName.get())
+
+        // Break the while loop if the pod is completed or we don't want to wait
+        if(watcher.watchOrStop(sId)) {
+          watch.close()
+          break
+        }
+      }
     }
   }
 
@@ -199,7 +204,8 @@ private[spark] class KubernetesClientApplication extends SparkApplication {
       kubernetesAppId,
       clientArguments.mainAppResource,
       clientArguments.mainClass,
-      clientArguments.driverArgs)
+      clientArguments.driverArgs,
+      clientArguments.proxyUser)
     // The master URL has been checked for validity already in SparkSubmit.
     // We just need to get rid of the "k8s://" prefix here.
     val master = KubernetesUtils.parseMasterUrl(sparkConf.get("spark.master"))

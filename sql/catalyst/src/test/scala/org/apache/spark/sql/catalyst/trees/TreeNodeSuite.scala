@@ -31,6 +31,7 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.{AliasIdentifier, FunctionIdentifier, InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.dsl.expressions.DslString
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.plans.{LeftOuter, NaturalJoin, SQLHelper}
@@ -582,7 +583,9 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
         JObject(
           "class" -> classOf[Union].getName,
           "num-children" -> 2,
-          "children" -> List(0, 1)),
+          "children" -> List(0, 1),
+          "byName" -> JBool(false),
+          "allowMissingCol" -> JBool(false)),
         JObject(
           "class" -> classOf[JsonTestTreeNode].getName,
           "num-children" -> 0,
@@ -594,7 +597,8 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("toJSON should not throws java.lang.StackOverflowError") {
-    val udf = ScalaUDF(SelfReferenceUDF(), BooleanType, Seq("col1".attr), false :: Nil)
+    val udf = ScalaUDF(SelfReferenceUDF(), BooleanType, Seq("col1".attr),
+      Option(ExpressionEncoder[String]()) :: Nil)
     // Should not throw java.lang.StackOverflowError
     udf.toJSON
   }

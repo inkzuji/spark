@@ -19,15 +19,15 @@ package org.apache.spark.sql
 
 import java.nio.charset.StandardCharsets
 import java.sql.{Date, Timestamp}
-import java.util.TimeZone
 
 import scala.util.Random
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.plans.logical.OneRowRelation
-import org.apache.spark.sql.catalyst.util.DateTimeTestUtils
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{withDefaultTimeZone, UTC}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -489,6 +489,12 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     withSQLConf(SQLConf.LEGACY_SIZE_OF_NULL.key -> "false") {
       testSizeOfArray(sizeOfNull = null)
     }
+    // size(null) should return null under ansi mode.
+    withSQLConf(
+      SQLConf.LEGACY_SIZE_OF_NULL.key -> "true",
+      SQLConf.ANSI_ENABLED.key -> "true") {
+      testSizeOfArray(sizeOfNull = null)
+    }
   }
 
   test("dataframe arrays_zip function") {
@@ -566,6 +572,12 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
 
   test("map size function") {
     withSQLConf(SQLConf.LEGACY_SIZE_OF_NULL.key -> "false") {
+      testSizeOfMap(sizeOfNull = null)
+    }
+    // size(null) should return null under ansi mode.
+    withSQLConf(
+      SQLConf.LEGACY_SIZE_OF_NULL.key -> "true",
+      SQLConf.ANSI_ENABLED.key -> "true") {
       testSizeOfMap(sizeOfNull = null)
     }
   }
@@ -651,7 +663,9 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       Row(null)
     )
 
-    withSQLConf(SQLConf.LEGACY_ALLOW_DUPLICATED_MAP_KEY.key -> "true") {
+    intercept[SparkException](df1.selectExpr("map_concat(map1, map2)").collect())
+    intercept[SparkException](df1.select(map_concat($"map1", $"map2")).collect())
+    withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
       checkAnswer(df1.selectExpr("map_concat(map1, map2)"), expected1a)
       checkAnswer(df1.select(map_concat($"map1", $"map2")), expected1a)
     }
@@ -922,10 +936,12 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
     val answer = Seq(Row(Seq(2, 3)), Row(Seq(5)))
 
     checkAnswer(df.select(slice(df("x"), 2, 2)), answer)
+    checkAnswer(df.select(slice(df("x"), lit(2), lit(2))), answer)
     checkAnswer(df.selectExpr("slice(x, 2, 2)"), answer)
 
     val answerNegative = Seq(Row(Seq(3)), Row(Seq(5)))
     checkAnswer(df.select(slice(df("x"), -1, 1)), answerNegative)
+    checkAnswer(df.select(slice(df("x"), lit(-1), lit(1))), answerNegative)
     checkAnswer(df.selectExpr("slice(x, -1, 1)"), answerNegative)
   }
 
@@ -1013,7 +1029,7 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
         Timestamp.valueOf("2018-01-01 12:00:00"),
         Timestamp.valueOf("2018-01-02 00:00:00")))))
 
-    DateTimeTestUtils.withDefaultTimeZone(TimeZone.getTimeZone("UTC")) {
+    withDefaultTimeZone(UTC) {
       checkAnswer(
         spark.sql("select sequence(" +
           "   cast('2018-01-01' as date)" +
@@ -1515,6 +1531,13 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       df.selectExpr("concat(map(1, 2), map(3, 4))")
     }
     assert(e.getMessage.contains("string, binary or array"))
+  }
+
+  test("SPARK-31227: Non-nullable null type should not coerce to nullable type in concat") {
+    val actual = spark.range(1).selectExpr("concat(array(), array(1)) as arr")
+    val expected = spark.range(1).selectExpr("array(1) as arr")
+    checkAnswer(actual, expected)
+    assert(actual.schema === expected.schema)
   }
 
   test("flatten function") {
@@ -3070,7 +3093,13 @@ class DataFrameFunctionsSuite extends QueryTest with SharedSparkSession {
       checkAnswer(dfExample2.select(transform_keys(col("j"), (k, v) => k + v)),
         Seq(Row(Map(2.0 -> 1.0, 3.4 -> 1.4, 4.7 -> 1.7))))
 
-      withSQLConf(SQLConf.LEGACY_ALLOW_DUPLICATED_MAP_KEY.key -> "true") {
+      intercept[SparkException] {
+        dfExample3.selectExpr("transform_keys(x, (k, v) ->  k % 2 = 0 OR v)").collect()
+      }
+      intercept[SparkException] {
+        dfExample3.select(transform_keys(col("x"), (k, v) => k % 2 === 0 || v)).collect()
+      }
+      withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
         checkAnswer(dfExample3.selectExpr("transform_keys(x, (k, v) ->  k % 2 = 0 OR v)"),
           Seq(Row(Map(true -> true, true -> false))))
 

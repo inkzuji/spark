@@ -56,7 +56,7 @@ private[spark] abstract class KubernetesConf(val sparkConf: SparkConf) {
   }
 
   def workerDecommissioning: Boolean =
-    sparkConf.get(org.apache.spark.internal.config.Worker.WORKER_DECOMMISSION_ENABLED)
+    sparkConf.get(org.apache.spark.internal.config.DECOMMISSION_ENABLED)
 
   def nodeSelector: Map[String, String] =
     KubernetesUtils.parsePrefixedKeyValuePairs(sparkConf, KUBERNETES_NODE_SELECTOR_PREFIX)
@@ -77,7 +77,8 @@ private[spark] class KubernetesDriverConf(
     val appId: String,
     val mainAppResource: MainAppResource,
     val mainClass: String,
-    val appArgs: Array[String])
+    val appArgs: Array[String],
+    val proxyUser: Option[String])
   extends KubernetesConf(sparkConf) {
 
   override val resourceNamePrefix: String = {
@@ -107,6 +108,11 @@ private[spark] class KubernetesDriverConf(
 
   override def annotations: Map[String, String] = {
     KubernetesUtils.parsePrefixedKeyValuePairs(sparkConf, KUBERNETES_DRIVER_ANNOTATION_PREFIX)
+  }
+
+  def serviceAnnotations: Map[String, String] = {
+    KubernetesUtils.parsePrefixedKeyValuePairs(sparkConf,
+      KUBERNETES_DRIVER_SERVICE_ANNOTATION_PREFIX)
   }
 
   override def secretNamesToMountPaths: Map[String, String] = {
@@ -193,11 +199,18 @@ private[spark] object KubernetesConf {
       appId: String,
       mainAppResource: MainAppResource,
       mainClass: String,
-      appArgs: Array[String]): KubernetesDriverConf = {
+      appArgs: Array[String],
+      proxyUser: Option[String]): KubernetesDriverConf = {
     // Parse executor volumes in order to verify configuration before the driver pod is created.
     KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, KUBERNETES_EXECUTOR_VOLUMES_PREFIX)
 
-    new KubernetesDriverConf(sparkConf.clone(), appId, mainAppResource, mainClass, appArgs)
+    new KubernetesDriverConf(
+      sparkConf.clone(),
+      appId,
+      mainAppResource,
+      mainClass,
+      appArgs,
+      proxyUser)
   }
 
   def createExecutorConf(

@@ -16,10 +16,11 @@
 #
 
 import datetime
-import sys
+from itertools import chain
+import re
 
 from pyspark.sql import Row
-from pyspark.sql.functions import udf, input_file_name
+from pyspark.sql.functions import udf, input_file_name, col, percentile_approx, lit
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
@@ -165,10 +166,6 @@ class FunctionsTests(ReusedSQLTestCase):
             TypeError,
             "must be the same type",
             lambda: df.select(col('name').substr(0, lit(1))))
-        if sys.version_info.major == 2:
-            self.assertRaises(
-                TypeError,
-                lambda: df.select(col('name').substr(long(0), long(1))))
 
         for name in _string_functions.keys():
             self.assertEqual(
@@ -294,6 +291,16 @@ class FunctionsTests(ReusedSQLTestCase):
         for result in results:
             self.assertEqual(result[0], '')
 
+    def test_slice(self):
+        from pyspark.sql.functions import slice, lit
+
+        df = self.spark.createDataFrame([([1, 2, 3],), ([4, 5],)], ['x'])
+
+        self.assertEquals(
+            df.select(slice(df.x, 2, 2).alias("sliced")).collect(),
+            df.select(slice(df.x, lit(2), lit(2)).alias("sliced")).collect(),
+        )
+
     def test_array_repeat(self):
         from pyspark.sql.functions import array_repeat, lit
 
@@ -337,8 +344,31 @@ class FunctionsTests(ReusedSQLTestCase):
 
         self.assertListEqual(actual, expected)
 
+    def test_percentile_approx(self):
+        actual = list(chain.from_iterable([
+            re.findall("(percentile_approx\\(.*\\))", str(x)) for x in [
+                percentile_approx(col("foo"), lit(0.5)),
+                percentile_approx(col("bar"), 0.25, 42),
+                percentile_approx(col("bar"), [0.25, 0.5, 0.75]),
+                percentile_approx(col("foo"), (0.05, 0.95), 100),
+                percentile_approx("foo", 0.5),
+                percentile_approx("bar", [0.1, 0.9], lit(10)),
+            ]
+        ]))
+
+        expected = [
+            "percentile_approx(foo, 0.5, 10000)",
+            "percentile_approx(bar, 0.25, 42)",
+            "percentile_approx(bar, array(0.25, 0.5, 0.75), 10000)",
+            "percentile_approx(foo, array(0.05, 0.95), 100)",
+            "percentile_approx(foo, 0.5, 10000)",
+            "percentile_approx(bar, array(0.1, 0.9), 10)"
+        ]
+
+        self.assertListEqual(actual, expected)
+
     def test_higher_order_function_failures(self):
-        from pyspark.sql.functions import col, exists, transform
+        from pyspark.sql.functions import col, transform
 
         # Should fail with varargs
         with self.assertRaises(ValueError):
@@ -363,10 +393,10 @@ class FunctionsTests(ReusedSQLTestCase):
 
 if __name__ == "__main__":
     import unittest
-    from pyspark.sql.tests.test_functions import *
+    from pyspark.sql.tests.test_functions import *  # noqa: F401
 
     try:
-        import xmlrunner
+        import xmlrunner  # type: ignore[import]
         testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None

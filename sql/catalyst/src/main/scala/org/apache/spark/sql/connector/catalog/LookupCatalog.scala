@@ -18,7 +18,8 @@
 package org.apache.spark.sql.connector.catalog
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 
 /**
@@ -56,8 +57,14 @@ private[sql] trait LookupCatalog extends Logging {
    * Extract session catalog and identifier from a multi-part identifier.
    */
   object SessionCatalogAndIdentifier {
+    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.MultipartIdentifierHelper
+
     def unapply(parts: Seq[String]): Option[(CatalogPlugin, Identifier)] = parts match {
       case CatalogAndIdentifier(catalog, ident) if CatalogV2Util.isSessionCatalog(catalog) =>
+        if (ident.namespace.length != 1) {
+          throw new AnalysisException(
+            s"The namespace in session catalog must have exactly one name part: ${parts.quoted}")
+        }
         Some(catalog, ident)
       case _ => None
     }
@@ -146,6 +153,30 @@ private[sql] trait LookupCatalog extends Logging {
         }
       case _ =>
         None
+    }
+  }
+
+  def parseSessionCatalogFunctionIdentifier(nameParts: Seq[String]): FunctionIdentifier = {
+    if (nameParts.length == 1 && catalogManager.v1SessionCatalog.isTempFunction(nameParts.head)) {
+      return FunctionIdentifier(nameParts.head)
+    }
+
+    nameParts match {
+      case SessionCatalogAndIdentifier(_, ident) =>
+        if (nameParts.length == 1) {
+          // If there is only one name part, it means the current catalog is the session catalog.
+          // Here we don't fill the default database, to keep the error message unchanged for
+          // v1 commands.
+          FunctionIdentifier(nameParts.head, None)
+        } else {
+          ident.namespace match {
+            case Array(db) => FunctionIdentifier(ident.name, Some(db))
+            case _ =>
+              throw new AnalysisException(s"Unsupported function name '$ident'")
+          }
+        }
+
+      case _ => throw new AnalysisException("function is only supported in v1 catalog")
     }
   }
 }

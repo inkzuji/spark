@@ -25,11 +25,10 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.spark.{SparkConf, SparkException}
-import org.apache.spark.annotation.Evolving
+import org.apache.spark.annotation.{Evolving, Since}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Python.PYSPARK_EXECUTOR_MEMORY
-import org.apache.spark.util.Utils
 
 /**
  * Resource profile to associate with an RDD. A ResourceProfile allows the user to
@@ -38,6 +37,7 @@ import org.apache.spark.util.Utils
  * This is meant to be immutable so user can't change it after building.
  */
 @Evolving
+@Since("3.1.0")
 class ResourceProfile(
     val executorResources: Map[String, ExecutorResourceRequest],
     val taskResources: Map[String, TaskResourceRequest]) extends Serializable with Logging {
@@ -74,6 +74,25 @@ class ResourceProfile(
 
   private[spark] def getTaskCpus: Option[Int] = {
     taskResources.get(ResourceProfile.CPUS).map(_.amount.toInt)
+  }
+
+  private[spark] def getPySparkMemory: Option[Long] = {
+    executorResources.get(ResourceProfile.PYSPARK_MEM).map(_.amount.toLong)
+  }
+
+  /*
+   * This function takes into account fractional amounts for the task resource requirement.
+   * Spark only supports fractional amounts < 1 to basically allow for multiple tasks
+   * to use the same resource address.
+   * The way the scheduler handles this is it adds the same address the number of slots per
+   * address times and then the amount becomes 1. This way it re-uses the same address
+   * the correct number of times. ie task requirement amount=0.25 -> addrs["0", "0", "0", "0"]
+   * and scheduler task amount=1. See ResourceAllocator.slotsPerAddress.
+   */
+  private[spark] def getSchedulerTaskResourceAmount(resource: String): Int = {
+    val taskAmount = taskResources.getOrElse(resource,
+      throw new SparkException(s"Resource $resource doesn't exist in profile id: $id"))
+   if (taskAmount.amount < 1) 1 else taskAmount.amount.toInt
   }
 
   private[spark] def getNumSlotsPerAddress(resource: String, sparkConf: SparkConf): Int = {
@@ -137,7 +156,7 @@ class ResourceProfile(
       assert(cpusPerTask > 0, "CPUs per task configuration has to be > 0")
       val coresPerExecutor = getExecutorCores.getOrElse(sparkConf.get(EXECUTOR_CORES))
       _coresLimitKnown = true
-      ResourceUtils.validateTaskCpusLargeEnough(coresPerExecutor, cpusPerTask)
+      ResourceUtils.validateTaskCpusLargeEnough(sparkConf, coresPerExecutor, cpusPerTask)
       val tasksBasedOnCores = coresPerExecutor / cpusPerTask
       // Note that if the cores per executor aren't set properly this calculation could be off,
       // we default it to just be 1 in order to allow checking of the rest of the custom
@@ -163,17 +182,6 @@ class ResourceProfile(
         numPartsPerResourceMap(rName) = parts
         val numTasks = ((execReq.amount * parts) / numPerTask).toInt
         if (taskLimit == -1 || numTasks < taskLimit) {
-          if (shouldCheckExecCores) {
-            // TODO - until resource profiles full implemented we need to error if cores not
-            // limiting resource because the scheduler code uses that for slots
-            throw new IllegalArgumentException("The number of slots on an executor has to be " +
-              "limited by the number of cores, otherwise you waste resources and " +
-              "some scheduling doesn't work properly. Your configuration has " +
-              s"core/task cpu slots = ${taskLimit} and " +
-              s"${execReq.resourceName} = ${numTasks}. " +
-              "Please adjust your configuration so that all resources require same number " +
-              "of executor slots.")
-          }
           limitingResource = rName
           taskLimit = numTasks
         }
@@ -183,17 +191,13 @@ class ResourceProfile(
           "no corresponding task resource request was specified.")
       }
     }
-    if(!shouldCheckExecCores && execResourceToCheck.nonEmpty) {
-      // if we can't rely on the executor cores config throw a warning for user
-      logWarning("Please ensure that the number of slots available on your " +
-        "executors is limited by the number of cores to task cpus and not another " +
-        "custom resource.")
-    }
     if (taskResourcesToCheck.nonEmpty) {
       throw new SparkException("No executor resource configs were not specified for the " +
         s"following task configs: ${taskResourcesToCheck.keys.mkString(",")}")
     }
-    logInfo(s"Limiting resource is $limitingResource at $taskLimit tasks per executor")
+    val limiting =
+      if (taskLimit == -1) "cpu" else s"$limitingResource at $taskLimit tasks per executor"
+    logInfo(s"Limiting resource is $limiting")
     _executorResourceSlotsPerAddr = Some(numPartsPerResourceMap.toMap)
     _maxTasksPerExecutor = if (taskLimit == -1) Some(1) else Some(taskLimit)
     _limitingResource = Some(limitingResource)
@@ -222,6 +226,11 @@ class ResourceProfile(
     }
   }
 
+  // check that the task resources and executor resources are equal, but id's could be different
+  private[spark] def resourcesEqual(rp: ResourceProfile): Boolean = {
+    rp.taskResources == taskResources && rp.executorResources == executorResources
+  }
+
   override def hashCode(): Int = Seq(taskResources, executorResources).hashCode()
 
   override def toString(): String = {
@@ -234,13 +243,15 @@ object ResourceProfile extends Logging {
   // task resources
   val CPUS = "cpus"
   // Executor resources
+  // Make sure add new executor resource in below allSupportedExecutorResources
   val CORES = "cores"
   val MEMORY = "memory"
+  val OFFHEAP_MEM = "offHeap"
   val OVERHEAD_MEM = "memoryOverhead"
   val PYSPARK_MEM = "pyspark.memory"
 
   // all supported spark executor resources (minus the custom resources like GPUs/FPGAs)
-  val allSupportedExecutorResources = Seq(CORES, MEMORY, OVERHEAD_MEM, PYSPARK_MEM)
+  val allSupportedExecutorResources = Seq(CORES, MEMORY, OVERHEAD_MEM, PYSPARK_MEM, OFFHEAP_MEM)
 
   val UNKNOWN_RESOURCE_PROFILE_ID = -1
   val DEFAULT_RESOURCE_PROFILE_ID = 0
@@ -286,6 +297,10 @@ object ResourceProfile extends Logging {
     ereqs.memory(conf.get(EXECUTOR_MEMORY).toString)
     conf.get(EXECUTOR_MEMORY_OVERHEAD).map(mem => ereqs.memoryOverhead(mem.toString))
     conf.get(PYSPARK_EXECUTOR_MEMORY).map(mem => ereqs.pysparkMemory(mem.toString))
+    if (conf.get(MEMORY_OFFHEAP_ENABLED)) {
+      // Explicitly add suffix b as default unit of offHeapMemory is Mib
+      ereqs.offHeapMemory(conf.get(MEMORY_OFFHEAP_SIZE).toString + "b")
+    }
     val execReq = ResourceUtils.parseAllResourceRequests(conf, SPARK_EXECUTOR_PREFIX)
     execReq.foreach { req =>
       val name = req.id.resourceName
@@ -310,11 +325,23 @@ object ResourceProfile extends Logging {
 
   private[spark] def getCustomTaskResources(
       rp: ResourceProfile): Map[String, TaskResourceRequest] = {
-    rp.taskResources.filterKeys(k => !k.equals(ResourceProfile.CPUS))
+    rp.taskResources.filterKeys(k => !k.equals(ResourceProfile.CPUS)).toMap
   }
 
   private[spark] def getCustomExecutorResources(
       rp: ResourceProfile): Map[String, ExecutorResourceRequest] = {
-    rp.executorResources.filterKeys(k => !ResourceProfile.allSupportedExecutorResources.contains(k))
+    rp.executorResources.
+      filterKeys(k => !ResourceProfile.allSupportedExecutorResources.contains(k)).toMap
   }
+
+  /*
+   * Get the number of cpus per task if its set in the profile, otherwise return the
+   * cpus per task for the default profile.
+   */
+  private[spark] def getTaskCpusOrDefaultForProfile(rp: ResourceProfile, conf: SparkConf): Int = {
+    rp.getTaskCpus.getOrElse(conf.get(CPUS_PER_TASK))
+  }
+
+  private[spark] val PYSPARK_MEMORY_LOCAL_PROPERTY = "resource.pyspark.memory"
+  private[spark] val EXECUTOR_CORES_LOCAL_PROPERTY = "resource.executor.cores"
 }

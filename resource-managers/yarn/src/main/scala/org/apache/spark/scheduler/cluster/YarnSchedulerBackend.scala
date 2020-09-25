@@ -21,8 +21,7 @@ import java.util.EnumSet
 import java.util.concurrent.atomic.{AtomicBoolean}
 import javax.servlet.DispatcherType
 
-import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
@@ -66,6 +65,14 @@ private[spark] abstract class YarnSchedulerBackend(
     YarnSchedulerBackend.ENDPOINT_NAME, yarnSchedulerEndpoint)
 
   private implicit val askTimeout = RpcUtils.askRpcTimeout(sc.conf)
+
+  /**
+   * Declare implicit single thread execution context for futures doRequestTotalExecutors and
+   * doKillExecutors below, avoiding using the global execution context that may cause conflict
+   * with user code's execution of futures.
+   */
+  private implicit val schedulerEndpointEC = ExecutionContext.fromExecutorService(
+      ThreadUtils.newDaemonSingleThreadExecutor("yarn-scheduler-endpoint"))
 
   /** Application ID. */
   protected var appId: Option[ApplicationId] = None
@@ -130,12 +137,8 @@ private[spark] abstract class YarnSchedulerBackend(
     val filteredRPHostToLocalTaskCount = rpHostToLocalTaskCount.map { case (rpid, v) =>
       (rpid, v.filter { case (host, count) => !nodeBlacklist.contains(host) })
     }
-    // TODO - default everything to default profile until YARN pieces
-    val defaultProf = ResourceProfile.getOrCreateDefaultProfile(conf)
-    val hostToLocalTaskCount = filteredRPHostToLocalTaskCount.getOrElse(defaultProf.id, Map.empty)
-    val localityAwareTasks = numLocalityAwareTasksPerResourceProfileId.getOrElse(defaultProf.id, 0)
-    val numExecutors = resourceProfileToTotalExecs.getOrElse(defaultProf, 0)
-    RequestExecutors(numExecutors, localityAwareTasks, hostToLocalTaskCount, nodeBlacklist)
+    RequestExecutors(resourceProfileToTotalExecs, numLocalityAwareTasksPerResourceProfileId,
+      filteredRPHostToLocalTaskCount, nodeBlacklist)
   }
 
   /**
@@ -261,13 +264,14 @@ private[spark] abstract class YarnSchedulerBackend(
               case NonFatal(e) =>
                 logWarning(s"Attempted to get executor loss reason" +
                   s" for executor id ${executorId} at RPC address ${executorRpcAddress}," +
-                  s" but got no response. Marking as slave lost.", e)
-                RemoveExecutor(executorId, SlaveLost())
+                  s" but got no response. Marking as agent lost.", e)
+                RemoveExecutor(executorId, ExecutorProcessLost())
             }(ThreadUtils.sameThread)
         case None =>
           logWarning("Attempted to check for an executor loss reason" +
             " before the AM has registered!")
-          Future.successful(RemoveExecutor(executorId, SlaveLost("AM is not yet registered.")))
+          Future.successful(RemoveExecutor(executorId,
+            ExecutorProcessLost("AM is not yet registered.")))
       }
 
       removeExecutorMessage.foreach { message => driverEndpoint.send(message) }

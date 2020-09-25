@@ -163,7 +163,7 @@ object CommandUtils extends Logging {
       .getConfString("hive.exec.stagingdir", ".hive-staging")
     val filter = new PathFilterIgnoreNonData(stagingDir)
     val sizes = InMemoryFileIndex.bulkListLeafFiles(paths.flatten,
-      sparkSession.sessionState.newHadoopConf(), filter, sparkSession, areRootPaths = true).map {
+      sparkSession.sessionState.newHadoopConf(), filter, sparkSession, isRootLevel = true).map {
       case (_, files) => files.map(_.getLen).sum
     }
     // the size is 0 where paths(i) is not defined and sizes(i) where it is defined
@@ -385,5 +385,13 @@ object CommandUtils extends Logging {
 
   private def isDataPath(path: Path, stagingDir: String): Boolean = {
     !path.getName.startsWith(stagingDir) && DataSourceUtils.isDataPath(path)
+  }
+
+  def uncacheTableOrView(sparkSession: SparkSession, name: String): Unit = {
+    try {
+      sparkSession.catalog.uncacheTable(name)
+    } catch {
+      case NonFatal(e) => logWarning("Exception when attempting to uncache $name", e)
+    }
   }
 }
